@@ -1,16 +1,10 @@
-from __future__ import annotations
-
 from pathlib import Path
-from typing import List
 from ddgs import DDGS
-from openai import OpenAI
-from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+import json
 import os
 
-
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
 
 PERSON_FILE = Path("people/001-charles-h-bennett.md")
 
@@ -20,14 +14,9 @@ PERSON_IDENTITY = """
 Charles H. Bennett is the American physicist and information theorist
 associated with IBM Research.
 
-He is known for:
-- quantum information science
-- quantum cryptography
-- BB84 with Gilles Brassard
-- reversible computation
-- quantum teleportation
-- information theory
-- the 2025 ACM A.M. Turing Award with Gilles Brassard
+He is known for quantum information science, quantum cryptography,
+BB84 with Gilles Brassard, reversible computation, quantum teleportation,
+and the 2025 ACM A.M. Turing Award.
 
 Do NOT confuse him with Charles Henry Bennett, the British Victorian
 illustrator and author who lived from 1828 to 1867.
@@ -36,58 +25,16 @@ illustrator and author who lived from 1828 to 1867.
 MAX_SEARCH_RESULTS = 10
 
 
-# ---------------------------------------------------------
-# STRUCTURED OUTPUT MODELS
-# ---------------------------------------------------------
+def search_web():
 
-class CandidateResult(BaseModel):
-    title: str
-    url: str
-    snippet: str
-
-
-class CandidateEvaluation(BaseModel):
-    title: str
-    url: str
-
-    same_person: bool = Field(
-        description="True only if the source refers to the intended Charles H. Bennett."
+    query = (
+        '"Charles Henry Bennett" OR "Charles H. Bennett" '
+        'interview podcast quantum IBM'
     )
 
-    relevant_interview_or_research_source: bool = Field(
-        description=(
-            "True if this is a useful interview, podcast, talk, profile, "
-            "award page, or research-related source about the intended person."
-        )
-    )
+    print("Searching:", query)
 
-    confidence: float = Field(
-        ge=0,
-        le=1,
-        description="Confidence that the identity classification is correct."
-    )
-
-    reason: str = Field(
-        description="Short explanation for the classification."
-    )
-
-
-class ResearchEvaluation(BaseModel):
-    person: str
-    evaluations: List[CandidateEvaluation]
-
-
-# ---------------------------------------------------------
-# SEARCH
-# ---------------------------------------------------------
-
-def search_web() -> List[CandidateResult]:
-
-    query = '"Charles Henry Bennett" OR "Charles H. Bennett" interview podcast quantum IBM'
-
-    print(f"Searching web for:\n{query}\n")
-
-    raw_results = list(
+    results = list(
         DDGS().text(
             query,
             region="us-en",
@@ -97,83 +44,45 @@ def search_web() -> List[CandidateResult]:
 
     candidates = []
 
-    for result in raw_results:
+    for result in results:
+        if result.get("title") and result.get("href"):
 
-        title = result.get("title", "")
-        url = result.get("href", "")
-        snippet = result.get("body", "")
-
-        if not title or not url:
-            continue
-
-        candidates.append(
-            CandidateResult(
-                title=title,
-                url=url,
-                snippet=snippet
-            )
-        )
-
-    print(f"Found {len(candidates)} candidates.")
+            candidates.append({
+                "title": result.get("title", ""),
+                "url": result.get("href", ""),
+                "snippet": result.get("body", "")
+            })
 
     return candidates
 
 
-# ---------------------------------------------------------
-# LLM JUDGMENT
-# ---------------------------------------------------------
+def evaluate_with_gemini(candidates):
 
-def evaluate_with_llm(
-    candidates: List[CandidateResult]
-) -> ResearchEvaluation:
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"]
+    )
 
-    client = OpenAI()
+    candidate_text = ""
 
-    candidate_text = "\n\n".join(
-        [
-            f"""
+    for i, item in enumerate(candidates, start=1):
+
+        candidate_text += f"""
 CANDIDATE {i}
 
 Title:
-{candidate.title}
+{item["title"]}
 
 URL:
-{candidate.url}
+{item["url"]}
 
 Snippet:
-{candidate.snippet}
-"""
-            for i, candidate in enumerate(candidates, start=1)
-        ]
-    )
+{item["snippet"]}
 
-    system_prompt = """
+"""
+
+    prompt = f"""
 You are a research relevance evaluator.
 
-Your task is identity disambiguation and source relevance evaluation.
-
-You must determine whether each search result refers to the intended
-person described by the user.
-
-A matching name alone is NOT enough.
-
-Use contextual evidence such as occupation, organization, dates,
-collaborators, research topics, awards, and other identity signals.
-
-Do not invent facts that are not supported by the supplied identity
-description or the search result.
-
-For each candidate:
-1. Determine whether it refers to the intended person.
-2. Determine whether it is a useful research/interview source.
-3. Give a confidence score between 0 and 1.
-4. Give a concise explanation.
-
-A result about another person with the same name must be marked
-same_person = false.
-"""
-
-    user_prompt = f"""
 INTENDED PERSON
 
 Name:
@@ -183,118 +92,146 @@ Identity:
 {PERSON_IDENTITY}
 
 
+TASK
+
+Evaluate every search result below.
+
+For each candidate determine:
+
+1. Does it refer to the intended Charles H. Bennett?
+2. Is it a useful research source about him?
+3. How confident are you?
+4. Why?
+
+A matching name alone is NOT enough.
+
+Use contextual evidence such as:
+- occupation
+- organization
+- research topics
+- collaborators
+- awards
+- historical dates
+
+A result about the Victorian illustrator must be rejected.
+
 SEARCH RESULTS
 
 {candidate_text}
 """
 
-    response = client.responses.parse(
-        model="gpt-5.6",
-        input=[
-            {
-                "role": "system",
-                "content": system_prompt
+    schema = {
+        "type": "object",
+        "properties": {
+            "person": {
+                "type": "string"
             },
-            {
-                "role": "user",
-                "content": user_prompt
+            "evaluations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_number": {
+                            "type": "integer"
+                        },
+                        "same_person": {
+                            "type": "boolean"
+                        },
+                        "useful_source": {
+                            "type": "boolean"
+                        },
+                        "confidence": {
+                            "type": "number"
+                        },
+                        "reason": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "candidate_number",
+                        "same_person",
+                        "useful_source",
+                        "confidence",
+                        "reason"
+                    ]
+                }
             }
-        ],
-        text_format=ResearchEvaluation
+        },
+        "required": [
+            "person",
+            "evaluations"
+        ]
+    }
+
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=schema
+        )
     )
 
-    return response.output_parsed
+    return json.loads(response.text)
 
 
-# ---------------------------------------------------------
-# DISPLAY RESULTS
-# ---------------------------------------------------------
+def print_results(candidates, evaluation):
 
-def print_evaluations(result: ResearchEvaluation):
+    print("\nLLM EVALUATION\n")
 
-    print()
-    print("=" * 70)
-    print(f"LLM evaluation for {result.person}")
-    print("=" * 70)
+    for item in evaluation["evaluations"]:
 
-    for i, evaluation in enumerate(
-        result.evaluations,
-        start=1
-    ):
+        index = item["candidate_number"] - 1
 
-        print()
-        print(f"{i}. {evaluation.title}")
+        candidate = candidates[index]
 
-        print(
-            "Same person:",
-            evaluation.same_person
-        )
-
-        print(
-            "Useful source:",
-            evaluation.relevant_interview_or_research_source
-        )
-
-        print(
-            "Confidence:",
-            evaluation.confidence
-        )
-
-        print(
-            "Reason:",
-            evaluation.reason
-        )
-
-        print(
-            "URL:",
-            evaluation.url
-        )
+        print("=" * 60)
+        print(candidate["title"])
+        print("URL:", candidate["url"])
+        print("Same person:", item["same_person"])
+        print("Useful source:", item["useful_source"])
+        print("Confidence:", item["confidence"])
+        print("Reason:", item["reason"])
 
 
-# ---------------------------------------------------------
-# UPDATE MARKDOWN
-# ---------------------------------------------------------
+def update_markdown(candidates, evaluation):
 
-def update_markdown(
-    evaluation: ResearchEvaluation
-):
+    accepted = []
+
+    for item in evaluation["evaluations"]:
+
+        if item["same_person"] and item["useful_source"]:
+
+            index = item["candidate_number"] - 1
+
+            accepted.append({
+                **candidates[index],
+                **item
+            })
+
+    start = "<!-- AUTO-UPDATE-START -->"
+    end = "<!-- AUTO-UPDATE-END -->"
 
     text = PERSON_FILE.read_text(
         encoding="utf-8"
     )
 
-    start_marker = "<!-- AUTO-UPDATE-START -->"
-    end_marker = "<!-- AUTO-UPDATE-END -->"
-
-    if (
-        start_marker not in text
-        or end_marker not in text
-    ):
+    if start not in text or end not in text:
         raise RuntimeError(
             "AUTO-UPDATE markers not found."
         )
 
-    accepted = [
-        item
-        for item in evaluation.evaluations
-        if (
-            item.same_person
-            and
-            item.relevant_interview_or_research_source
-        )
-    ]
-
     lines = [
-        start_marker,
+        start,
         "",
-        "### LLM-Validated Research Sources",
+        "### Gemini-Validated Research Sources",
         ""
     ]
 
     if not accepted:
 
         lines.append(
-            "No relevant sources passed the LLM identity check."
+            "No relevant sources passed the identity check."
         )
 
     else:
@@ -304,39 +241,28 @@ def update_markdown(
             start=1
         ):
 
-            lines.extend(
-                [
-                    f"#### {i}. {item.title}",
-                    "",
-                    f"[Open source]({item.url})",
-                    "",
-                    f"**Identity confidence:** "
-                    f"{item.confidence:.2f}",
-                    "",
-                    f"**Why accepted:** "
-                    f"{item.reason}",
-                    ""
-                ]
-            )
+            lines.extend([
+                f"#### {i}. {item['title']}",
+                "",
+                f"[Open source]({item['url']})",
+                "",
+                f"**Identity confidence:** "
+                f"{item['confidence']:.2f}",
+                "",
+                f"**Why accepted:** "
+                f"{item['reason']}",
+                ""
+            ])
 
-    lines.extend(
-        [
-            end_marker,
-            ""
-        ]
-    )
+    lines.extend([
+        end,
+        ""
+    ])
 
     new_section = "\n".join(lines)
 
-    before = text.split(
-        start_marker,
-        1
-    )[0]
-
-    after = text.split(
-        end_marker,
-        1
-    )[1]
+    before = text.split(start, 1)[0]
+    after = text.split(end, 1)[1]
 
     PERSON_FILE.write_text(
         before + new_section + after,
@@ -344,39 +270,36 @@ def update_markdown(
     )
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
-
 def main():
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not os.getenv("GEMINI_API_KEY"):
+
         raise RuntimeError(
-            "OPENAI_API_KEY environment variable is missing."
+            "GEMINI_API_KEY is missing."
         )
 
     candidates = search_web()
 
-    if not candidates:
-        raise RuntimeError(
-            "No search results found."
-        )
+    print(
+        f"Found {len(candidates)} candidate results."
+    )
 
-    result = evaluate_with_llm(
+    evaluation = evaluate_with_gemini(
         candidates
     )
 
-    print_evaluations(
-        result
+    print_results(
+        candidates,
+        evaluation
     )
 
     update_markdown(
-        result
+        candidates,
+        evaluation
     )
 
-    print()
     print(
-        f"Updated {PERSON_FILE}"
+        "\nResearch file updated."
     )
 
 
